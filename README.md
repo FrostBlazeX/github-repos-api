@@ -1,103 +1,110 @@
 # GitHub Repos API
 
-A small FastAPI service that serves GitHub repository data from a local SQLite
-database, with a language-stats endpoint powered by pandas, an AI endpoint
-that uses an LLM to generate a one-line pitch for any repo, and a tool-using
-agent that answers questions about the repos. Every LLM call is traced with
-Langfuse for latency, token, and cost visibility.
+A FastAPI service that serves GitHub repository data from a local SQLite database,
+with a pandas-powered stats endpoint, LLM endpoints (pitch, structured analysis),
+and a **tool-using agent** that answers questions by calling functions over the
+data. Instrumented end to end with Langfuse and wrapped in input/output guardrails.
 
-Built as a Python + AI-engineering learning project.
+Built as an AI-engineering portfolio project demonstrating the full production
+lifecycle: evaluation, observability, guardrails, and deployment.
+
+## Live demo
+
+**Live:** https://github-repos-api-lbg6.onrender.com
+
+- Interactive API docs: https://github-repos-api-lbg6.onrender.com/docs
+- Ask the agent: https://github-repos-api-lbg6.onrender.com/agent?q=How many Python repositories do I have?
+
+> Hosted on Render's free tier; the first request after an idle period takes
+> ~30-60s to wake.
 
 ## Features
 
-- REST API built with FastAPI, with interactive Swagger docs at `/docs`
-- Data served from a local SQLite database (`github.db`)
-- Typed request/response models with Pydantic
-- Path and query parameters, plus proper 404 handling
-- A pandas-powered `/stats` endpoint (repo counts by language)
-- An LLM-powered `/repos/{name}/pitch` endpoint (via Groq), with the API key
-  kept out of the code in a `.env` file
-- A tool-using `/agent` endpoint that answers questions by calling functions
-  over the SQLite data (LLM function calling), never guessing numbers or names
-- Full request tracing with Langfuse: prompt, response, latency, tokens, and
-  cost captured for every LLM call, grouped into one trace per request
-
-## Requirements
-
-- Python 3.12+
-- A free Groq API key from https://console.groq.com (needed for `/pitch` and `/agent`)
-- A free Langfuse account from https://cloud.langfuse.com (for tracing)
-- Dependencies listed in `requirements.txt`
-
-## Setup
-
-    python -m venv .venv
-    .venv\Scripts\Activate.ps1        # Windows (PowerShell)
-    # source .venv/bin/activate       # macOS / Linux
-    python -m pip install -r requirements.txt
-
-Create a `.env` file in the project root with your Groq key and Langfuse keys:
-
-    GROQ_API_KEY=your_key_here
-    LANGFUSE_PUBLIC_KEY=pk-lf-...
-    LANGFUSE_SECRET_KEY=sk-lf-...
-    LANGFUSE_HOST=https://cloud.langfuse.com      # us.cloud.langfuse.com for the US region
-
-(`.env` is git-ignored, so the keys are never committed.)
-
-You also need a `github.db` SQLite database with a `repos` table
-(columns: `name`, `stars`, `language`, `url`). It was built alongside a
-companion script that populates it from the GitHub API.
-
-## Running
-
-    uvicorn main:app --reload
-
-Then open http://127.0.0.1:8000/docs to explore the API interactively.
+- REST API with FastAPI, interactive Swagger docs at `/docs`
+- Data served from SQLite with parameterized queries; language stats via pandas
+- A tool-using `/agent` endpoint (LLM function calling over the database)
+- Structured analysis (`/repos/{name}/analyze`) validated against a Pydantic schema
+- Groq (`openai/gpt-oss-20b`) for all generation
 
 ## Endpoints
 
-| Method | Path                  | Description                                   |
-| ------ | --------------------- | --------------------------------------------- |
-| GET    | `/`                   | Welcome message                               |
-| GET    | `/repos`              | List all repos (optional `?language=` filter) |
-| GET    | `/repos/{name}`       | Get a single repo by name                     |
-| GET    | `/repos/{name}/pitch` | LLM-generated one-line pitch for a repo       |
-| GET    | `/agent`              | Tool-using agent; answers a `?q=` question    |
-| GET    | `/stats`              | Repo counts grouped by language (via pandas)  |
+| Method | Path                    | Description                                   |
+| ------ | ----------------------- | --------------------------------------------- |
+| GET    | `/repos`                | List all repos (optional `?language=` filter) |
+| GET    | `/repos/{name}`         | Get a single repo by name                     |
+| GET    | `/repos/{name}/pitch`   | LLM-generated one-line pitch                  |
+| GET    | `/repos/{name}/analyze` | Schema-validated structured analysis          |
+| GET    | `/agent`                | Tool-using agent; answers a `?q=` question    |
+| GET    | `/stats`                | Repo counts by language (pandas)              |
 
 ## Observability
 
-Every LLM call in the service is traced with [Langfuse](https://langfuse.com/).
-The OpenAI client is swapped for Langfuse's drop-in wrapper
-(`from langfuse.openai import OpenAI`), so each `chat.completions.create` call is
-recorded automatically with its prompt, response, latency, and token usage. The
-`/agent` handler opens an explicit parent span and wraps each tool call in its own
-child span, so one request becomes a single trace showing the full loop:
+Every LLM call is traced with Langfuse (drop-in OpenAI wrapper). The `/agent`
+handler opens a parent span and wraps each tool call, so one request is a single
+trace showing the full loop:
 
-    agent
-    ├── generation      (model decides which tool to call)
-    ├── tool:count_repos  (DB query, with its arguments and result)
-    └── generation      (model writes the final answer)
+```
+agent
+├── guardrail:injection   (input screening)
+├── generation            (model decides which tool to call)
+├── tool:count_repos      (DB query, with arguments and result)
+└── generation            (model writes the final answer)
+```
 
-This makes the agent debuggable: you can see exactly which tool the model chose,
-what arguments it passed, and what came back, rather than inferring it from a wrong
-answer.
+Prompt, response, latency, tokens, and cost are captured per step, with a custom
+model price registered so Groq costs are calculated.
 
-Cost is enabled by registering a custom model price for the Groq model in Langfuse
-(Project Settings → Models), since Groq pricing is not built in. With that in place,
-each generation shows its cost, which makes the per-request economics visible (for
-example, the agent's two model calls cost roughly twice a single-call endpoint).
+## Guardrails
 
-To view traces, make a request and open your Langfuse project under Tracing → Traces.
+- **Input, injection gate:** every `/agent` question is screened by a policy
+  classifier before any model call or tool runs. This matters because the agent has
+  live database tools, a successful injection is a real risk, not just bad text.
+  Blocked requests never reach the database.
+- **Output, schema enforcement:** `run_analysis` forces the model's output into a
+  Pydantic `RepoAnalysis` schema, retrying with the validation error fed back, and
+  falling back gracefully if it can't produce a valid result.
+- **Graceful fallback:** a model or tool failure returns a safe degraded response
+  (HTTP 200), never a 500 stack trace.
+
+## Results
+
+- The agent trace shows the full reason-act-observe-answer loop; injection attempts
+  are stopped at the guard with no tool execution (verifiable in the trace).
+- Two model calls per answer make the agent ~2x the cost/latency of a single-shot
+  endpoint, quantified from the traces rather than guessed.
+- Structured analysis is schema-valid or gracefully degraded, never malformed.
+
+## Running locally
+
+```bash
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+uvicorn main:app --reload
+```
+
+Environment variables (git-ignored `.env` locally; host secrets in production):
+
+```
+GROQ_API_KEY=...
+LANGFUSE_PUBLIC_KEY=...
+LANGFUSE_SECRET_KEY=...
+LANGFUSE_HOST=https://cloud.langfuse.com
+LANGFUSE_BASE_URL=https://cloud.langfuse.com
+```
+
+Requires a `github.db` SQLite file with a `repos` table (`name`, `stars`,
+`language`, `url`); it is committed so it deploys with the app.
+
+## Deployment
+
+Runs as a Python web service on Render's free tier. Lightweight (no ML libraries),
+so it fits the 512MB limit easily. Secrets are Render environment variables; the
+SQLite database travels in the repo. Start command:
+`uvicorn main:app --host 0.0.0.0 --port $PORT`.
 
 ## What it demonstrates
 
-- Building a REST API with FastAPI and Pydantic
-- Serving data from SQLite with parameterized queries
-- Data aggregation with pandas
-- Calling an LLM from a backend service
-- LLM function calling / a tool-using agent loop
-- Instrumenting an LLM service with tracing (Langfuse): latency, token, and cost
-  visibility across multi-step flows
-- Managing secrets with environment variables (`python-dotenv`)
+Building a REST API with FastAPI and Pydantic; SQLite with parameterized queries;
+data aggregation with pandas; an LLM tool-using agent loop; output-schema
+enforcement; distributed tracing (Langfuse) for latency/token/cost; input and
+output guardrails; and free-tier cloud deployment with managed secrets.
