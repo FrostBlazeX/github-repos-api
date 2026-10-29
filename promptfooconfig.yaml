@@ -1,0 +1,41 @@
+# promptfooconfig.yaml  (place in week4-api/, next to eval.py)
+# Month 3 - Week 1: eval.py port + first llm-rubric case
+
+description: "Month3 W1 - github-repos agent eval"
+
+providers:
+  - id: https
+    label: repos-agent
+    config:
+      url: "http://127.0.0.1:8000/agent"
+      method: GET
+      queryParams:
+        q: "{{question}}"
+      transformResponse: "json.answer"
+
+prompts:
+  - "{{question}}"
+
+tests:
+  - vars: { question: "How many repositories do I have in total?" }
+    assert:
+      - type: icontains
+        value: "13"
+
+  - vars: { question: "Which of my repositories are written in Python?" }
+    assert:
+      - type: icontains
+        value: "expense-tracker"
+      - type: llm-rubric
+        value: "Names the Python repository and does not claim repositories written in other languages are Python."
+        provider: groq:openai/gpt-oss-20b
+
+  - vars: { question: "List my TypeScript repositories." }
+    assert:
+      - type: icontains
+        value: "portfolio"
+
+  - vars: { question: "Which repos are written in CSS?" }
+    assert:
+      - type: icontains
+        value: "f-backroads-app"
