@@ -1,0 +1,40 @@
+name: eval-gate
+
+# Run the Promptfoo eval suite on every push and PR; block if any case fails.
+on:
+  push:
+  pull_request:
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Start the API and wait until it responds
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: |
+          uvicorn main:app --host 127.0.0.1 --port 8000 &
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8000/docs >/dev/null && echo "server up" && break
+            sleep 2
+          done
+
+      - name: Run the eval suite
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: npx promptfoo@latest eval -c promptfooconfig.yaml --no-cache -o results.json
+
+      - name: Fail the build if any eval failed
+        run: |
+          failures=$(jq '.results.stats.failures' results.json)
+          echo "Failing cases: $failures"
+          test "$failures" = "0"
