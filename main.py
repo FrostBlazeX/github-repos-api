@@ -7,7 +7,6 @@ from typing import Literal
 from pydantic import BaseModel, Field, ValidationError
 from dotenv import load_dotenv
 from langfuse import get_client
-from langfuse.openai import OpenAI
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -18,11 +17,24 @@ load_dotenv()
 
 DB_FILE = "github.db"
 
+# Use Langfuse's traced OpenAI wrapper only when Langfuse is actually configured.
+# Without keys (e.g. in CI, or if the observability backend is down), fall back to
+# the plain client so the app's LLM calls never depend on Langfuse being reachable.
+if os.environ.get("LANGFUSE_PUBLIC_KEY"):
+    from langfuse.openai import OpenAI
+else:
+    from openai import OpenAI
+
+langfuse = get_client()
+
+# .strip() guards against a trailing newline/whitespace in the secret value.
+# A stray \n makes the openai client raise LocalProtocolError("Illegal header
+# value") when it builds the Authorization header, surfacing as an
+# APIConnectionError on every Groq call. See the RAG CI eval-gate incident.
 client = OpenAI(
-    api_key=os.environ["GROQ_API_KEY"],
+    api_key=os.environ["GROQ_API_KEY"].strip(),
     base_url="https://api.groq.com/openai/v1",
 )
-langfuse = get_client()
 
 app = FastAPI(title="GitHub Repos API")
 

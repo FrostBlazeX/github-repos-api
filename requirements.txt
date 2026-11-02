@@ -3,6 +3,6 @@ uvicorn[standard]
 pandas
 pydantic
 python-dotenv
-langfuse
-openai
+langfuse==5.0.4
+openai==3.41.0
 slowapi
