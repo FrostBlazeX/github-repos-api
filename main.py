@@ -56,6 +56,13 @@ def require_api_key(key: str = Security(api_key_header)):
             status_code=401, detail="Invalid or missing API key")
 
 
+# --- Response cache (in-memory) ---
+# Identical questions return instantly, skipping the model and tools entirely.
+# In-memory and unbounded here (fine for a single instance / demo); production
+# would use an LRU with a TTL, or a shared store like Redis across instances.
+_AGENT_CACHE: dict[str, dict] = {}
+
+
 # ---------------------------------------------------------------------------
 # INPUT GUARDRAIL: injection / jailbreak detection via a policy classifier.
 # Screens the agent's question before any model call or tool runs. Critical here:
@@ -304,6 +311,15 @@ def agent(request: Request, q: str):
     with langfuse.start_as_current_observation(as_type="span", name="agent") as trace:
         trace.update(input={"q": q})
 
+        # CACHE: an identical question skips the injection check, model calls, and
+        # tools entirely. Only successful answers are cached (never rejections), so
+        # an attack never gets a cached pass.
+        cache_key = q.strip().lower()
+        if cache_key in _AGENT_CACHE:
+            cached = _AGENT_CACHE[cache_key]
+            trace.update(output=cached["answer"], metadata={"cache": "hit"})
+            return {**cached, "cached": True}
+
         # INPUT GUARDRAIL: injection / jailbreak gate, before any model call or tool.
         verdict = check_injection(q)
         if verdict.get("violation") == 1:
@@ -332,8 +348,11 @@ def agent(request: Request, q: str):
                 msg = completion.choices[0].message
 
                 if not msg.tool_calls:                  # no tool needed -> final answer
+                    result = {"answer": msg.content, "steps": step}
+                    # cache the successful answer
+                    _AGENT_CACHE[cache_key] = result
                     trace.update(output=msg.content)
-                    return {"answer": msg.content, "steps": step}
+                    return result
 
                 # record the model's tool request, normalizing empty arguments to "{}"
                 messages.append({
