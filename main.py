@@ -1,12 +1,16 @@
 import os
 import sqlite3
 import pandas as pd
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Depends, Security
+from fastapi.security import APIKeyHeader
 from typing import Literal
 from pydantic import BaseModel, Field, ValidationError
 from dotenv import load_dotenv
 from langfuse import get_client
 from langfuse.openai import OpenAI
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 import json
 
 
@@ -21,6 +25,35 @@ client = OpenAI(
 langfuse = get_client()
 
 app = FastAPI(title="GitHub Repos API")
+
+
+# --- Rate limiting (per client IP) ---
+# Behind Render/Cloudflare the real client IP is in X-Forwarded-For; request.client
+# is just the proxy. Prefer the forwarded IP so limits are per-user, not per-proxy.
+def client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for")
+    return fwd.split(",")[0].strip() if fwd else get_remote_address(request)
+
+
+limiter = Limiter(key_func=client_ip)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+# --- API-key auth (optional) ---
+# If API_KEY is set, protected endpoints require a matching X-API-Key header.
+# If it's unset, auth is disabled: that's how the public demo runs (open, but
+# rate-limited). Set API_KEY in the host's secrets to lock the API down.
+API_KEY = os.environ.get("API_KEY")
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+def require_api_key(key: str = Security(api_key_header)):
+    if not API_KEY:
+        return  # auth disabled (demo mode)
+    if key != API_KEY:
+        raise HTTPException(
+            status_code=401, detail="Invalid or missing API key")
 
 
 # ---------------------------------------------------------------------------
@@ -162,8 +195,9 @@ def get_repo(name: str):
     return results[0]
 
 
-@app.get("/repos/{name}/pitch")
-def pitch_repo(name: str):
+@app.get("/repos/{name}/pitch", dependencies=[Depends(require_api_key)])
+@limiter.limit("20/minute")
+def pitch_repo(request: Request, name: str):
     results = query_db("SELECT * FROM repos WHERE name = ?", (name,))
     if not results:
         raise HTTPException(status_code=404, detail=f"No repo named '{name}'")
@@ -184,8 +218,9 @@ def pitch_repo(name: str):
     return {"name": repo["name"], "pitch": pitch}
 
 
-@app.get("/repos/{name}/analyze")
-def analyze_repo(name: str):
+@app.get("/repos/{name}/analyze", dependencies=[Depends(require_api_key)])
+@limiter.limit("20/minute")
+def analyze_repo(request: Request, name: str):
     results = query_db("SELECT * FROM repos WHERE name = ?", (name,))
     if not results:
         raise HTTPException(status_code=404, detail=f"No repo named '{name}'")
@@ -197,8 +232,9 @@ def analyze_repo(name: str):
     return analysis.model_dump()
 
 
-@app.get("/analyze-all")
-def analyze_all():
+@app.get("/analyze-all", dependencies=[Depends(require_api_key)])
+@limiter.limit("3/minute")
+def analyze_all(request: Request):
     repos = query_db("SELECT * FROM repos")
     output = []
     for repo in repos:
@@ -261,8 +297,9 @@ TOOLS = [
 ]
 
 
-@app.get("/agent")
-def agent(q: str):
+@app.get("/agent", dependencies=[Depends(require_api_key)])
+@limiter.limit("20/minute")
+def agent(request: Request, q: str):
     # One parent span for the whole run; LLM calls and tools nest under it.
     with langfuse.start_as_current_observation(as_type="span", name="agent") as trace:
         trace.update(input={"q": q})
