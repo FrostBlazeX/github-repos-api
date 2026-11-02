@@ -24,7 +24,7 @@ jobs:
         run: |
           uvicorn main:app --host 127.0.0.1 --port 8000 &
           for i in $(seq 1 30); do
-            curl -fs http://127.0.0.1:8000/doccs >/dev/null && echo "server up" && break
+            curl -sf http://127.0.0.1:8000/docs >/dev/null && echo "server up" && break
             sleep 2
           done
 
@@ -33,8 +33,9 @@ jobs:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: npx promptfoo@latest eval -c promptfooconfig.yaml --no-cache -o results.json
 
-      - name: Fail the build if any eval failed
+      - name: Fail the build if any eval failed OR errored
         run: |
           failures=$(jq '.results.stats.failures' results.json)
-          echo "Failing cases: failures"
-          test "$failures" = "0"
+          errors=$(jq '.results.stats.errors // 0' results.json)
+          echo "Failing cases: $failures | errors: $errors"
+          test "$failures" = "0" && test "$errors" = "0"

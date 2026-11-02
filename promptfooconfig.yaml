@@ -20,7 +20,7 @@ tests:
   - vars: { question: "How many repositories do I have in total?" }
     assert:
       - type: icontains
-        value: "13"
+        value: "999"
 
   - vars: { question: "Which of my repositories are written in Python?" }
     assert:
