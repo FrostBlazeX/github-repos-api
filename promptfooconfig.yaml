@@ -16,26 +16,50 @@ providers:
 prompts:
   - "{{question}}"
 
+# GROUND TRUTH BELOW IS THE FIXTURE (see seed_fixture.py), NOT live data:
+#   5 repos — Python: alpha, beta, epsilon | TypeScript: gamma | CSS: delta
+#   alpha is the single most-starred (100).
+# CI seeds this before launching the API, so refreshing the real github.db
+# can never break these assertions. Deterministic string checks where the fact
+# is fixed; one llm-rubric (on the stronger gpt-oss-120b judge) for the one
+# thing a substring can't express — that NO wrong repo is mislabelled Python.
 tests:
   - vars: { question: "How many repositories do I have in total?" }
     assert:
       - type: icontains
-        value: "13"
+        value: "5"
 
   - vars: { question: "Which of my repositories are written in Python?" }
     assert:
       - type: icontains
-        value: "expense-tracker"
+        value: "alpha"
+      - type: icontains
+        value: "beta"
+      - type: icontains
+        value: "epsilon"
       - type: llm-rubric
-        value: "Names the Python repository and does not claim repositories written in other languages are Python."
-        provider: groq:openai/gpt-oss-20b
+        value: "Lists the Python repositories and does NOT claim the non-Python repos (gamma is TypeScript, delta is CSS) are Python."
+        provider: groq:openai/gpt-oss-120b
 
   - vars: { question: "List my TypeScript repositories." }
     assert:
       - type: icontains
-        value: "portfolio"
+        value: "gamma"
 
   - vars: { question: "Which repos are written in CSS?" }
     assert:
       - type: icontains
-        value: "f-backroads-app"
+        value: "delta"
+
+  # Multi-hop: exercises the new tools (language_breakdown -> find_repos ->
+  # repo_detail). The answer must name the top language (Python) and its
+  # most-starred repo (alpha).
+  - vars:
+      {
+        question: "Which language do I use most, and what is the single most-starred repo in it?",
+      }
+    assert:
+      - type: icontains
+        value: "Python"
+      - type: icontains
+        value: "alpha"

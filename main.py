@@ -15,7 +15,9 @@ import json
 
 load_dotenv()
 
-DB_FILE = "github.db"
+# DB path is configurable so CI can point the app at a fixed FIXTURE database
+# (decoupled from live data), while production falls back to the real github.db.
+DB_FILE = os.environ.get("DB_FILE", "github.db")
 
 # Use Langfuse's traced OpenAI wrapper only when Langfuse is actually configured.
 # Without keys (e.g. in CI, or if the observability backend is down), fall back to
@@ -438,15 +440,55 @@ AGENT_SYSTEM = {
     ),
 }
 
+# --- Explicit planning (opt-in) ---
+# Before executing, a planner call drafts a short ordered plan. gpt-oss-20b is
+# fine for this toy domain; 120b plans noticeably better on harder questions.
+PLANNER_MODEL = "openai/gpt-oss-20b"
+PLANNER_SYSTEM = (
+    "You are the PLANNING step of an agent that answers questions about a user's "
+    "GitHub repositories using these tools: count_repos, list_repos, "
+    "language_breakdown, repo_detail, find_repos, compare_repos. "
+    "Break the user's question into a short ordered list of concrete steps, each "
+    "naming the tool to use and why. Use 1-4 steps; a simple question gets one. "
+    "Do NOT answer the question or call any tool yourself — only plan. "
+    'Respond with ONLY a JSON object: {"plan": ["step 1", "step 2", ...]}.'
+)
+
+
+def make_plan(q: str, history: list) -> list:
+    """Draft an ordered plan for the question. Fails OPEN: on any error it
+    returns [] so the agent simply runs reactively instead of breaking."""
+    with langfuse.start_as_current_observation(as_type="span", name="plan") as p:
+        try:
+            messages = [{"role": "system", "content": PLANNER_SYSTEM}] + history + [
+                {"role": "user", "content": q}]
+            completion = client.chat.completions.create(
+                model=PLANNER_MODEL,
+                messages=messages,
+                response_format={"type": "json_object"},
+                temperature=0,
+            )
+            raw = completion.choices[0].message.content or "{}"
+            data = json.loads(raw)
+            plan = data.get("plan", [])
+            plan = [str(s) for s in plan][:4] if isinstance(plan, list) else []
+            p.update(input={"q": q}, output={"plan": plan})
+            return plan
+        except Exception as e:
+            p.update(output={"error": str(e)[:120]})
+            return []
+
 
 @app.get("/agent", dependencies=[Depends(require_api_key)])
 @limiter.limit("20/minute")
-def agent(request: Request, q: str, session: str | None = None):
+def agent(request: Request, q: str, session: str | None = None,
+          plan: bool = False):
     # One parent span for the whole run; LLM calls and tools nest under it.
     with langfuse.start_as_current_observation(as_type="span", name="agent") as trace:
-        trace.update(input={"q": q, "session": session})
+        trace.update(input={"q": q, "session": session, "plan": plan})
 
         stateful = session is not None
+        plan_steps: list = []
 
         # CACHE (stateless only): an identical question skips the injection check,
         # model calls, and tools entirely. Only successful answers are cached (never
@@ -473,6 +515,20 @@ def agent(request: Request, q: str, session: str | None = None):
         history = _SESSIONS.get(session, []) if stateful else []
         messages = [AGENT_SYSTEM] + history + [{"role": "user", "content": q}]
 
+        # EXPLICIT PLANNING (opt-in): draft a plan, then inject it as guidance right
+        # after the system prompt. It's advisory — the reactive loop below still runs
+        # and can adapt. Kept out of saved history (see the system-role filter on save)
+        # because a plan is specific to this turn, not part of the conversation.
+        if plan:
+            plan_steps = make_plan(q, history)
+            if plan_steps:
+                plan_text = ("Plan for this question:\n"
+                             + "\n".join(f"{i}. {s}" for i,
+                                         s in enumerate(plan_steps, 1))
+                             + "\nExecute it using the tools. Adapt if a tool result "
+                               "requires it.")
+                messages.insert(1, {"role": "system", "content": plan_text})
+
         # OUTPUT GUARDRAIL: wrap the whole loop so a model/tool failure degrades
         # politely instead of throwing a 500.
         try:
@@ -486,18 +542,23 @@ def agent(request: Request, q: str, session: str | None = None):
 
                 if not msg.tool_calls:                  # no tool needed -> final answer
                     if stateful:
-                        # record the assistant's reply, then persist the trimmed
-                        # transcript (minus the system message, which we re-prepend
-                        # every turn) so the next call continues this conversation.
+                        # record the assistant's reply, then persist the conversation.
+                        # Keep only user/assistant/tool turns — drop system messages
+                        # (the base prompt AND any injected plan), since a plan is
+                        # specific to this turn, not part of the conversation history.
                         messages.append(
                             {"role": "assistant", "content": msg.content or ""})
-                        _SESSIONS[session] = _cap_history(messages[1:])
+                        convo = [m for m in messages[1:]
+                                 if m.get("role") != "system"]
+                        _SESSIONS[session] = _cap_history(convo)
                         result = {"answer": msg.content,
                                   "steps": step, "session": session}
                     else:
                         result = {"answer": msg.content, "steps": step}
                         # cache the successful answer
                         _AGENT_CACHE[cache_key] = result
+                    if plan_steps:
+                        result["plan"] = plan_steps
                     trace.update(output=msg.content)
                     return result
 

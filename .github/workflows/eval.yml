@@ -8,6 +8,10 @@ on:
 jobs:
   eval:
     runs-on: ubuntu-latest
+    # Point the app at a FIXED fixture DB (seeded below), not the real github.db,
+    # so the eval's ground truth is decoupled from live repo data.
+    env:
+      DB_FILE: fixture.db
     steps:
       - uses: actions/checkout@v4
 
@@ -18,11 +22,14 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Seed the fixture database (stable eval ground truth)
+        run: python seed_fixture.py
+
       - name: Start the API and wait until it responds
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: |
-          uvicorn main:app --host 127.0.0.1 --port 8000 &
+          uvicorn main:app --host 127.0.0.1 --port 8000 > server.log 2>&1 &
           for i in $(seq 1 30); do
             curl -sf http://127.0.0.1:8000/docs >/dev/null && echo "server up" && break
             sleep 2
@@ -31,7 +38,8 @@ jobs:
       - name: Run the eval suite
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-        run: npx promptfoo@latest eval -c promptfooconfig.yaml --no-cache -o results.json
+        # -j 1 serializes calls so the suite doesn't burst past Groq's rate limit
+        run: npx promptfoo@latest eval -c promptfooconfig.yaml --no-cache -j 1 -o results.json
 
       - name: Fail the build if any eval failed OR errored
         run: |
@@ -39,3 +47,7 @@ jobs:
           errors=$(jq '.results.stats.errors // 0' results.json)
           echo "Failing cases: $failures | errors: $errors"
           test "$failures" = "0" && test "$errors" = "0"
+
+      - name: Show server logs (for debugging)
+        if: always()
+        run: cat server.log || true
