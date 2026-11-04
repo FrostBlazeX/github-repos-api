@@ -295,7 +295,68 @@ def list_repos(language: str | None = None) -> dict:
     return {"repos": [r["name"] for r in rows]}
 
 
-AVAILABLE_TOOLS = {"count_repos": count_repos, "list_repos": list_repos}
+def language_breakdown() -> dict:
+    """How many repos per language, most first. Lets the agent reason about
+    'which language do I use most' before drilling into a specific one."""
+    rows = query_db(
+        "SELECT COALESCE(language, 'Unknown') AS language, COUNT(*) AS n "
+        "FROM repos GROUP BY language ORDER BY n DESC")
+    return {"breakdown": [{"language": r["language"], "count": r["n"]} for r in rows]}
+
+
+def repo_detail(name: str) -> dict:
+    """Full detail for one repo by name. Returns an error dict (not an
+    exception) if there's no match, so the model can recover in-loop."""
+    rows = query_db(
+        "SELECT name, stars, language, url FROM repos WHERE name = ? COLLATE NOCASE",
+        (name,))
+    if not rows:
+        return {"error": f"No repo named '{name}'."}
+    return rows[0]
+
+
+def find_repos(language: str | None = None, min_stars: int | None = None) -> dict:
+    """Find repos matching optional filters (language and/or a minimum star
+    count), sorted by stars descending. Both filters omitted returns all."""
+    sql = "SELECT name, stars, language FROM repos WHERE 1=1"
+    params: list = []
+    if language:
+        sql += " AND language = ? COLLATE NOCASE"
+        params.append(language)
+    if min_stars is not None:
+        sql += " AND stars >= ?"
+        params.append(min_stars)
+    sql += " ORDER BY stars DESC"
+    rows = query_db(sql, tuple(params))
+    return {"matches": rows, "count": len(rows)}
+
+
+def compare_repos(name_a: str, name_b: str) -> dict:
+    """Compare two repos by star count. Error dict if either name is missing."""
+    def fetch(n):
+        r = query_db(
+            "SELECT name, stars, language, url FROM repos WHERE name = ? COLLATE NOCASE",
+            (n,))
+        return r[0] if r else None
+
+    a, b = fetch(name_a), fetch(name_b)
+    missing = [n for n, r in [(name_a, a), (name_b, b)] if r is None]
+    if missing:
+        return {"error": f"No repo named: {', '.join(missing)}."}
+    more = "tie" if a["stars"] == b["stars"] else (
+        a["name"] if a["stars"] > b["stars"] else b["name"])
+    return {"a": a, "b": b, "more_stars": more,
+            "star_difference": abs(a["stars"] - b["stars"])}
+
+
+AVAILABLE_TOOLS = {
+    "count_repos": count_repos,
+    "list_repos": list_repos,
+    "language_breakdown": language_breakdown,
+    "repo_detail": repo_detail,
+    "find_repos": find_repos,
+    "compare_repos": compare_repos,
+}
 
 # --- How we DESCRIBE those tools to the model ---
 TOOLS = [
@@ -312,6 +373,34 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {
             "language": {"type": "string", "description": "Language to filter by. Omit for all."}
         }},
+    }},
+    {"type": "function", "function": {
+        "name": "language_breakdown",
+        "description": "Count of repositories per programming language, highest first. Use this to find which language is most/least used before drilling in.",
+        "parameters": {"type": "object", "properties": {}},
+    }},
+    {"type": "function", "function": {
+        "name": "repo_detail",
+        "description": "Get full detail (stars, language, url) for one repository by its exact name.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string", "description": "Exact repository name."}
+        }, "required": ["name"]},
+    }},
+    {"type": "function", "function": {
+        "name": "find_repos",
+        "description": "Find repositories matching filters, sorted by stars (most first). Filter by language, by a minimum star count, or both. Omit both to get all repos ranked by stars.",
+        "parameters": {"type": "object", "properties": {
+            "language": {"type": "string", "description": "Language to filter by. Omit for any."},
+            "min_stars": {"type": "integer", "description": "Only repos with at least this many stars. Omit for no star floor."}
+        }},
+    }},
+    {"type": "function", "function": {
+        "name": "compare_repos",
+        "description": "Compare two repositories by star count. Returns both repos' details, which has more stars, and the difference.",
+        "parameters": {"type": "object", "properties": {
+            "name_a": {"type": "string", "description": "First repository name."},
+            "name_b": {"type": "string", "description": "Second repository name."}
+        }, "required": ["name_a", "name_b"]},
     }},
 ]
 
