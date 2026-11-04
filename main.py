@@ -75,6 +75,32 @@ def require_api_key(key: str = Security(api_key_header)):
 _AGENT_CACHE: dict[str, dict] = {}
 
 
+# --- Conversation memory (in-memory, per session) ---
+# When a client passes ?session=<id>, we persist that conversation's transcript
+# and replay it next call, so the agent can resolve follow-ups like "what about
+# the TypeScript ones?". No session => stateless (unchanged; that's the path the
+# eval gate exercises). Same demo caveat as the cache: in-memory and
+# single-instance, so a restart forgets everything; production uses a shared
+# store (Redis/DB) with a TTL per conversation.
+_SESSIONS: dict[str, list] = {}
+
+# Context windows are bounded, so we keep only the most recent transcript
+# messages per session. We never let a kept transcript START mid-turn: an
+# OpenAI-style API rejects a 'tool' message that doesn't immediately follow the
+# assistant message that requested it, so we trim forward to the next 'user'
+# turn, which is always a valid resumption point.
+_MAX_HISTORY = 24
+
+
+def _cap_history(msgs: list) -> list:
+    if len(msgs) <= _MAX_HISTORY:
+        return msgs
+    trimmed = msgs[-_MAX_HISTORY:]
+    while trimmed and trimmed[0].get("role") != "user":
+        trimmed = trimmed[1:]
+    return trimmed
+
+
 # ---------------------------------------------------------------------------
 # INPUT GUARDRAIL: injection / jailbreak detection via a policy classifier.
 # Screens the agent's question before any model call or tool runs. Critical here:
@@ -404,19 +430,31 @@ TOOLS = [
     }},
 ]
 
+AGENT_SYSTEM = {
+    "role": "system",
+    "content": (
+        "You answer questions about the user's GitHub repositories. "
+        "Use the tools to get real data — never guess numbers or names."
+    ),
+}
+
 
 @app.get("/agent", dependencies=[Depends(require_api_key)])
 @limiter.limit("20/minute")
-def agent(request: Request, q: str):
+def agent(request: Request, q: str, session: str | None = None):
     # One parent span for the whole run; LLM calls and tools nest under it.
     with langfuse.start_as_current_observation(as_type="span", name="agent") as trace:
-        trace.update(input={"q": q})
+        trace.update(input={"q": q, "session": session})
 
-        # CACHE: an identical question skips the injection check, model calls, and
-        # tools entirely. Only successful answers are cached (never rejections), so
-        # an attack never gets a cached pass.
+        stateful = session is not None
+
+        # CACHE (stateless only): an identical question skips the injection check,
+        # model calls, and tools entirely. Only successful answers are cached (never
+        # rejections), so an attack never gets a cached pass. Bypassed when stateful,
+        # because earlier turns change the answer and a question-only key would leak
+        # one conversation's answer into another.
         cache_key = q.strip().lower()
-        if cache_key in _AGENT_CACHE:
+        if not stateful and cache_key in _AGENT_CACHE:
             cached = _AGENT_CACHE[cache_key]
             trace.update(output=cached["answer"], metadata={"cache": "hit"})
             return {**cached, "cached": True}
@@ -430,12 +468,10 @@ def agent(request: Request, q: str):
                                    "reason": verdict.get("reason", "")})
             return {"answer": answer, "rejected": "injection"}
 
-        messages = [
-            {"role": "system", "content":
-                "You answer questions about the user's GitHub repositories. "
-                "Use the tools to get real data — never guess numbers or names."},
-            {"role": "user", "content": q},
-        ]
+        # Replay this session's prior transcript (empty when stateless or brand new),
+        # so the model sees the conversation so far and can resolve follow-ups.
+        history = _SESSIONS.get(session, []) if stateful else []
+        messages = [AGENT_SYSTEM] + history + [{"role": "user", "content": q}]
 
         # OUTPUT GUARDRAIL: wrap the whole loop so a model/tool failure degrades
         # politely instead of throwing a 500.
@@ -449,9 +485,19 @@ def agent(request: Request, q: str):
                 msg = completion.choices[0].message
 
                 if not msg.tool_calls:                  # no tool needed -> final answer
-                    result = {"answer": msg.content, "steps": step}
-                    # cache the successful answer
-                    _AGENT_CACHE[cache_key] = result
+                    if stateful:
+                        # record the assistant's reply, then persist the trimmed
+                        # transcript (minus the system message, which we re-prepend
+                        # every turn) so the next call continues this conversation.
+                        messages.append(
+                            {"role": "assistant", "content": msg.content or ""})
+                        _SESSIONS[session] = _cap_history(messages[1:])
+                        result = {"answer": msg.content,
+                                  "steps": step, "session": session}
+                    else:
+                        result = {"answer": msg.content, "steps": step}
+                        # cache the successful answer
+                        _AGENT_CACHE[cache_key] = result
                     trace.update(output=msg.content)
                     return result
 
