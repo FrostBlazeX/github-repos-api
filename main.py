@@ -446,13 +446,28 @@ AGENT_SYSTEM = {
 PLANNER_MODEL = "openai/gpt-oss-20b"
 PLANNER_SYSTEM = (
     "You are the PLANNING step of an agent that answers questions about a user's "
-    "GitHub repositories using these tools: count_repos, list_repos, "
-    "language_breakdown, repo_detail, find_repos, compare_repos. "
-    "Break the user's question into a short ordered list of concrete steps, each "
-    "naming the tool to use and why. Use 1-4 steps; a simple question gets one. "
-    "Do NOT answer the question or call any tool yourself — only plan. "
+    "GitHub repositories. Break the user's question into a short ordered list of "
+    "concrete steps, each naming the tool to use and why. Use 1-4 steps; a simple "
+    "question gets one. You may ONLY use the tools listed above, and must respect "
+    "exactly what each one RETURNS — never assume a tool provides data it does not "
+    "(e.g. a tool that only lists names cannot give star counts; for stars, use the "
+    "tool whose description mentions stars). Do NOT answer the question or call any "
+    "tool yourself — only plan. "
     'Respond with ONLY a JSON object: {"plan": ["step 1", "step 2", ...]}.'
 )
+
+
+def _tool_catalog() -> str:
+    """Render the real tool registry (TOOLS) so the planner sees exactly what each
+    tool takes and does. Derived from the single source of truth, so adding a tool
+    updates the planner automatically — and it can't plan against imaginary tools."""
+    lines = []
+    for t in TOOLS:
+        fn = t["function"]
+        props = fn.get("parameters", {}).get("properties", {})
+        args = ", ".join(props) if props else "no args"
+        lines.append(f"- {fn['name']}({args}): {fn['description']}")
+    return "\n".join(lines)
 
 
 def make_plan(q: str, history: list) -> list:
@@ -460,7 +475,11 @@ def make_plan(q: str, history: list) -> list:
     returns [] so the agent simply runs reactively instead of breaking."""
     with langfuse.start_as_current_observation(as_type="span", name="plan") as p:
         try:
-            messages = [{"role": "system", "content": PLANNER_SYSTEM}] + history + [
+            system_content = (
+                "Available tools (name, arguments, and exactly what each does):\n"
+                + _tool_catalog() + "\n\n" + PLANNER_SYSTEM
+            )
+            messages = [{"role": "system", "content": system_content}] + history + [
                 {"role": "user", "content": q}]
             completion = client.chat.completions.create(
                 model=PLANNER_MODEL,
